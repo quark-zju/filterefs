@@ -31,9 +31,10 @@
 
 #define FUSE_USE_VERSION 26
 
-#ifndef FREFS_VERSION
-# define FREFS_VERSION "unknown"
+#ifndef FREFS_GIT_VERSION
+# define FREFS_GIT_VERSION ""
 #endif
+#define FREFS_VERSION (sizeof(FREFS_GIT_VERSION) > 1 ? FREFS_GIT_VERSION : "v0.1")
 
 #include <sys/types.h>
 #include <sys/stat.h>
@@ -472,7 +473,7 @@ static int frefs_parse_opt(void *data, const char *arg, int key, struct fuse_arg
       print_usage(outargs->argv[0]);
       exit(0);
     case KEY_VERSION:
-      fprintf(stdout, "filterefs version %s\n", FREFS_VERSION);
+      fprintf(stdout, "filterefs %s\n", FREFS_VERSION);
       exit(0);
     case KEY_READABLE_CONFIG:
       readable_config_path = strdup(arg + (arg[1] == '-' ? 17 : 2));
