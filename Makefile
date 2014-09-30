@@ -18,5 +18,7 @@ main.o: main.c
 clean:
 	-rm -f *.o **/*.o filterefs
 
+# only root can use -o dev and -o allow_other, which is useful for filterefs.
+# filterefs passes fstat as is, so it's probably okay.
 install: filterefs
-	install -D -m0755 -oroot -groot -s $< $(PREFIX)/bin/filterefs
+	install -D -m6755 -oroot -groot -s $< $(PREFIX)/bin/filterefs
