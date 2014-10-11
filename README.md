@@ -55,6 +55,14 @@ $ touch /tmp/abc
 $ mv /tmp/def /tmp/abc
 ```
 
+Notes
+-----
+
+The config files must NOT contain user-generated-content.
+filterefs does not verify every regular expressions and is vulnerable to regular expression injection.
+
+FUSE enforces `-o nodev,nosuid` for non-root users. If you want to use device files, run filterefs as root and add `-o dev`.
+
 License
 -------
 GPL2.
