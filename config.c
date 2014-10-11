@@ -32,7 +32,7 @@ const int FREFS_PERM_READ = 1;
 const int FREFS_PERM_WRITE = 2;
 
 
-static int frefs_config_build_regex_from_file(const char *filepath, regex_t *pwhite_re, regex_t *pblack_re) {
+static int frefs_config_build_regex_from_file(const char *filepath, regex_t *pwhite_re, regex_t *pblack_re, int *enabled) {
   int result = 0;
 # define str_define(name, init_size) \
   char *name = NULL; \
@@ -84,16 +84,19 @@ static int frefs_config_build_regex_from_file(const char *filepath, regex_t *pwh
         re_add_line(white_str, line_buf);
       }
     }
+
+    str_append(white_str, ")$");
+    str_append(black_str, ")$");
+
+    INFO("%s whitelist re: %s", filepath, white_str);
+    INFO("%s blacklist re: %s", filepath, black_str);
+
+    re_compile(white_str, pwhite_re);
+    re_compile(black_str, pblack_re);
+    *enabled = 1;
+  } else {
+    *enabled = 0;
   }
-
-  str_append(white_str, ")$");
-  str_append(black_str, ")$");
-
-  INFO("%s whitelist re: %s", filepath, white_str);
-  INFO("%s blacklist re: %s", filepath, black_str);
-
-  re_compile(white_str, pwhite_re);
-  re_compile(black_str, pblack_re);
 
 cleanup:
   if (white_str) free(white_str);
@@ -112,18 +115,20 @@ int frefs_config_import(frefs_config_t *pconfig, const char *read_filepath, cons
   // lines start with '!' are blacklist
   // lines start with '#' are comments
   int ret = 0;
-  ret = frefs_config_build_regex_from_file(read_filepath, &(pconfig->read_white_re), &(pconfig->read_black_re));
+  ret = frefs_config_build_regex_from_file(read_filepath, &(pconfig->read_white_re), &(pconfig->read_black_re), &(pconfig->read_re_enabled));
   if (ret) return ret;
 
-  ret = frefs_config_build_regex_from_file(write_filepath, &(pconfig->write_white_re), &(pconfig->write_black_re));
+  ret = frefs_config_build_regex_from_file(write_filepath, &(pconfig->write_white_re), &(pconfig->write_black_re), &(pconfig->write_re_enabled));
   return ret;
 }
 
 int frefs_config_get_file_permission(frefs_config_t *pconfig, const char *path, int permission) {
   int result = 0;
 # define re_match(re, str) (regexec(&(re), (str), 0, NULL, 0) == 0)
-# define re_check_permission(name, str) \
-  (!re_match(pconfig->name ## _black_re, str) && re_match(pconfig->name ## _white_re, str))
+# define re_check_permission(name, str, fallback) \
+  (pconfig->name ## _re_enabled ?\
+     (!re_match(pconfig->name ## _black_re, str) && re_match(pconfig->name ## _white_re, str))\
+   : fallback)
 
   if (path && path[0] == '/' && path[1] == 0) {
     // always allow read '/'
@@ -133,11 +138,11 @@ int frefs_config_get_file_permission(frefs_config_t *pconfig, const char *path, 
   if (pconfig) {
     // check write
     if (permission & FREFS_PERM_WRITE) {
-      if (re_check_permission(write, path)) result |= FREFS_PERM_WRITE;
+      if (re_check_permission(write, path, 0)) result |= FREFS_PERM_WRITE;
     } 
     // check read
     if (((permission & FREFS_PERM_READ) != 0) && ((result & FREFS_PERM_READ) == 0)) {
-      if (re_check_permission(read, path)) result |= FREFS_PERM_READ;
+      if (re_check_permission(read, path, 1)) result |= FREFS_PERM_READ;
     }
   }
   INFO("frefs_config_get_file_permission(\"%s\", %d) = %d", path, permission, result);

@@ -421,7 +421,9 @@ static void print_usage(const char *progname) {
     "\n"
     "options:\n"
     "  -r  --readable-config  readable config file path.\n"
+    "                         if missing, everything is readable.\n"
     "  -w  --writable-config  writable config file path.\n"
+    "                         if missing, nothing is writable.\n"
     "  -o  opt,[opt...]       fuse mount options can be used.\n"
     "  -h  --help             print help\n"
     "  -V  --version          print version\n"
@@ -507,11 +509,6 @@ int main(int argc, char *argv[]) {
     fprintf(stderr, "invalid arguments\n");
     fprintf(stderr, "see `%s -h' for usage\n", argv[0]);
     exit(1);
-  }
-
-  if (!readable_config_path) {
-    fprintf(stderr, "warning: --readable-config is missing\n");
-    fflush(stderr);
   }
 
   if (frefs_config_import(&config, readable_config_path, writable_config_path)) {

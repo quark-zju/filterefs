@@ -26,6 +26,8 @@ struct frefs_config {
   regex_t read_black_re;
   regex_t write_white_re;
   regex_t write_black_re;
+  int read_re_enabled;
+  int write_re_enabled;
 };
 
 typedef struct frefs_config frefs_config_t;
