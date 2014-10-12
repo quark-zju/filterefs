@@ -61,7 +61,16 @@ static int frefs_config_build_regex_from_file(const char *filepath, regex_t *pwh
   str_define(line_buf, 0);
   FILE *fp = NULL;
 
-  if (filepath) {
+  if (filepath && strncmp(filepath, "re://", 5) == 0) {
+    // treat it as a special file, which contains regex directly in one line
+    const char * line = filepath + 5;
+    if (line[0] == '!') {  // blacklist
+      re_add_line(black_str, line + 1);
+    } else {  // whitelist
+      re_add_line(white_str, line);
+    }
+    *enabled = 1;
+  } else if (filepath) {
     fp = fopen(filepath, "r");
     if (!fp) {
       WARN("can not open file: %s", filepath);
@@ -84,7 +93,12 @@ static int frefs_config_build_regex_from_file(const char *filepath, regex_t *pwh
         re_add_line(white_str, line_buf);
       }
     }
+    *enabled = 1;
+  } else {
+    *enabled = 0;
+  }
 
+  if (*enabled) {
     str_append(white_str, ")$");
     str_append(black_str, ")$");
 
@@ -93,9 +107,6 @@ static int frefs_config_build_regex_from_file(const char *filepath, regex_t *pwh
 
     re_compile(white_str, pwhite_re);
     re_compile(black_str, pblack_re);
-    *enabled = 1;
-  } else {
-    *enabled = 0;
   }
 
 cleanup:
