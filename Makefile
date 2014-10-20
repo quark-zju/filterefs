@@ -8,7 +8,7 @@ GIT_VERSION:=$(shell [ -e .git ] && git describe --abbrev=4 --tags --always --di
 .PHONY: all clean install
 
 filterefs: utils/debug.o config.o main.o
-	$(LD) -o $@ -lfuse -pthread $^
+	$(LD) -o $@ $^ -pthread -lfuse
 
 main.o: main.c
 	$(CC) -c -o $@ $(CFLAGS) -pthread -DFREFS_GIT_VERSION=\"$(GIT_VERSION)\" -D_FILE_OFFSET_BITS=64 -I/usr/include/fuse $<
