@@ -86,7 +86,7 @@ static const char *path_join(const char *dirname, const char *basename) {
   int base_len = strlen(basename);
   size_t size = dir_len + base_len + 2;
 
-  if (size > last_size) {
+  if (size > last_size || last_size == 0) {
     result = realloc(result, dir_len + base_len + 2);
     last_size = size;
   }
