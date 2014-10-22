@@ -34,7 +34,7 @@
 #ifndef FREFS_GIT_VERSION
 # define FREFS_GIT_VERSION ""
 #endif
-#define FREFS_VERSION (sizeof(FREFS_GIT_VERSION) > 1 ? FREFS_GIT_VERSION : "v0.1")
+#define FREFS_VERSION (sizeof(FREFS_GIT_VERSION) > 1 ? FREFS_GIT_VERSION : "v0.4")
 
 #include <sys/types.h>
 #include <sys/stat.h>
@@ -67,9 +67,11 @@ static frefs_config_t config;
 
 
 #define ensure_read_perm(path) \
-  if (!frefs_config_get_file_permission(&config, path, FREFS_PERM_READ)) { return -EPERM; }
+  if (!frefs_config_get_file_permission(&config, path, FREFS_PERM_READ)) { return -ENOENT; }
 #define ensure_write_perm(path) \
-  if (!frefs_config_get_file_permission(&config, path, FREFS_PERM_WRITE)) { return -EPERM; }
+  { int perm = frefs_config_get_file_permission(&config, path, FREFS_PERM_READ | FREFS_PERM_WRITE); \
+    if (perm == FREFS_PERM_READ) return -EPERM; \
+    else if (perm == 0) return -ENOENT; }
 #define return_checked(exp) \
   { int _ret = (exp); return _ret == -1 ? -errno : _ret; }
 #define return_checked_zero(exp) \
