@@ -34,6 +34,7 @@
   assert(name ## _size >= 1); \
   int len = strlen(str); \
   name ## _size += len; \
-  name = realloc(name, name ## _size); \
+  char *new_name = realloc(name, name ## _size); \
+  if (new_name) name = new_name; else /* realloc failed */ abort(); \
   char *curr_pos = name + (name ## _size) - 1 - len; \
   strncpy(curr_pos, str, name ## _size - (curr_pos - name)); }

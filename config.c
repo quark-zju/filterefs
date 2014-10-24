@@ -41,7 +41,7 @@ static int frefs_config_build_regex_from_file(const char *filepath, regex_t *pwh
   str_define(name, 1); \
   str_append(name, "^(");
 # define re_add_line(name, line) \
-  if (line && *line != 0) { \
+  if (line != NULL && *line != 0) { \
     int first = name ## _size <= 3; \
     str_append(name, (first ?  "(" : "|(")); \
     str_append(name, (line)); \
@@ -110,10 +110,10 @@ static int frefs_config_build_regex_from_file(const char *filepath, regex_t *pwh
   }
 
 cleanup:
-  if (white_str) free(white_str);
-  if (black_str) free(black_str);
-  if (line_buf) free(line_buf);
-  if (fp) fclose(fp);
+  if (white_str) { free(white_str); white_str = NULL; }
+  if (black_str) { free(black_str); black_str = NULL; }
+  if (line_buf) { free(line_buf); line_buf = NULL; }
+  if (fp) { fclose(fp); fp = NULL; }
   return result;
 # undef re_compile
 # undef re_define
