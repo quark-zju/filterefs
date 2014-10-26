@@ -83,7 +83,7 @@ static frefs_config_t config;
 #define checked_zero(exp) \
   ((exp) == -1 ? -errno : 0)
 
-static const size_t PROC_FILE_MAX_SIZE = 4096;
+static const size_t PROC_FILE_MAX_SIZE = 32768;
 
 static char *path_join(const char *dirname, const char *basename) {
   if (!dirname || dirname[0] == 0) return strdup(basename);
@@ -518,9 +518,23 @@ static int frefs_read(const char *path, char *buf, size_t size, off_t offset, st
   // ensure_read_perm(path);
 
   with_rpath {
+    int skip = 0;
+
+    if (forward_cg_proc_path && strncmp(path, "/proc/", sizeof("/proc/") - 1) == 0) {
+      // forward via pid-translate service
+      static char *socket_path = "/proc/../pid-translate.sock";
+      const char *rsocket_path = translate_path(socket_path);
+      if (rsocket_path && rsocket_path != socket_path && access(rsocket_path, F_OK) == 0) {
+        res = forward_read(rpath, buf, size, offset, rsocket_path);
+        skip = 1;
+      }
+      free_rpath(&rsocket_path, socket_path);
+    }
+
+    if (skip) continue;
+
     int fd = open(rpath, O_RDONLY);
     if (fd == -1) { res = -errno; continue; }
-
     res = pread(fd, buf, size, offset);
     close(fd);
   }

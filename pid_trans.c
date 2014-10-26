@@ -3,6 +3,7 @@
 #endif
 
 #include <dirent.h>
+#include <errno.h>
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -115,22 +116,35 @@ cleanup:
   return stop;
 }
 
-static pid_t query_pid(const char *proc_path, const char *socket_path, pid_t orig_pid) {
-  pid_t result = 0;
-  // as we only know orig_pid (pid in parent namespace),
-  // and we are not root, not able to send struct ucred with
-  // a fake pid. enum all pids.
+static int connect_service(const char *socket_path, char mode) {
   int sfd = socket(AF_UNIX, SOCK_STREAM, 0);
-  if (sfd == -1) goto cleanup;
+  if (sfd == -1) goto failure;
 
   struct sockaddr_un sun;
   sun.sun_family = AF_UNIX;
   strcpy(sun.sun_path, socket_path);
 
-  if (connect(sfd, (struct sockaddr*)&sun, sizeof(sun)) == -1) goto cleanup;
+  if (connect(sfd, (struct sockaddr*)&sun, sizeof(sun)) == -1) goto failure;
 
   int optval = 1;
-  if (setsockopt(sfd, SOL_SOCKET, SO_PASSCRED, &optval, sizeof(optval)) == -1) goto cleanup;
+  if (setsockopt(sfd, SOL_SOCKET, SO_PASSCRED, &optval, sizeof(optval)) == -1) goto failure;
+
+  if (send(sfd, &mode, sizeof mode, MSG_NOSIGNAL) == -1) goto failure;
+
+  return sfd;
+
+failure:
+  if (sfd != -1) close(sfd);
+  return -1;
+}
+
+static pid_t query_pid(const char *proc_path, const char *socket_path, pid_t orig_pid) {
+  pid_t result = 0;
+  // as we only know orig_pid (pid in parent namespace),
+  // and we are not root, not able to send struct ucred with
+  // a fake pid. enum all pids.
+  int sfd = connect_service(socket_path, 'p');
+  if (sfd == -1) goto cleanup;
 
   struct cb_qpid_arg arg;
   arg.resultp = &result;
@@ -139,7 +153,7 @@ static pid_t query_pid(const char *proc_path, const char *socket_path, pid_t ori
   enum_pids(proc_path, cb_qpid, &arg);
 
 cleanup:
-  close(sfd);
+  if (sfd != -1) close(sfd);
   return result;
 }
 
@@ -186,6 +200,29 @@ static pid_t find_same_in_proc(const char *proc_path, const char *fname, const c
 
   enum_pids(proc_path, cb_fsip, (void *)&arg);
   return result;
+}
+
+int forward_read(const char *path, char *buf, size_t size, off_t offset, const char *socket_path) {
+  errno = EIO;
+  int sfd = connect_service(socket_path, 'r');
+  if (sfd == -1) goto failure;
+
+  long len = strlen(path) + 1;
+  if (send(sfd, &len, sizeof len, MSG_NOSIGNAL) == -1) goto failure;
+  if (send(sfd, path, len, MSG_NOSIGNAL) == -1) goto failure;
+  if (send(sfd, &size, sizeof size, MSG_NOSIGNAL) == -1) goto failure;
+  if (send(sfd, &offset, sizeof offset, MSG_NOSIGNAL) == -1) goto failure;
+
+  ssize_t n;
+  if (recv(sfd, &n, sizeof n, MSG_WAITALL) != sizeof n) goto failure;
+  if (n > size) n = size;
+  recv(sfd, buf, n, MSG_WAITALL);
+  close(sfd);
+  return n;
+
+failure:
+  if (sfd != -1) close(sfd);
+  return -1;
 }
 
 pid_t translate_pid(pid_t orig_pid, const char *orig_proc, const char *new_proc) {
