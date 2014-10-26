@@ -27,7 +27,9 @@
  *   See the file COPYING.
  */
 
-#define _GNU_SOURCE
+#ifndef _GNU_SOURCE
+# define _GNU_SOURCE
+#endif
 
 #define FUSE_USE_VERSION 26
 
@@ -56,6 +58,7 @@
 #include <linux/limits.h>
 
 #include "config.h"
+#include "pid_trans.h"
 #include "utils/debug.h"
 
 
@@ -80,27 +83,7 @@ static frefs_config_t config;
 #define checked_zero(exp) \
   ((exp) == -1 ? -errno : 0)
 
-static const size_t PROC_FILE_MAX_SIZE = 4095;
-
-char *fs_read(const char *path, size_t size) {
-  char *result = NULL;
-  FILE *fp = NULL;
-
-  fp = fopen(path, "r");
-  if (!fp) goto cleanup;
-
-  // note: fseek won't work on special files in /proc/
-  // cannot use fseek, ftell to get file size
-  result = malloc(size + 1);
-  memset(result, 0, size + 1);
-  result[0] = 0;
-  rewind(fp);
-  fread(result, 1, size, fp);
-
-cleanup:
-  if (fp) fclose(fp);
-  return result;
-}
+static const size_t PROC_FILE_MAX_SIZE = 4096;
 
 static char *path_join(const char *dirname, const char *basename) {
   if (!dirname || dirname[0] == 0) return strdup(basename);
@@ -123,68 +106,13 @@ static char *path_join(const char *dirname, const char *basename) {
 }
 
 // http://womble.decadent.org.uk/readdir_r-advisory.html
-static size_t dirent_buf_size(DIR * dirp) {
+size_t dirent_buf_size(DIR * dirp) {
   static const size_t min_name_max = 512;
   long name_max = fpathconf(dirfd(dirp), _PC_NAME_MAX);
   if (name_max == -1) name_max = NAME_MAX;  // guess
   if (name_max < min_name_max) name_max = min_name_max;
   size_t name_end = (size_t)offsetof(struct dirent, d_name) + name_max + 1;
   return (name_end > sizeof(struct dirent) ? name_end : sizeof(struct dirent));
-}
-
-pid_t translate_pid(pid_t orig_pid, const char *orig_proc, const char *new_proc) {
-  // TODO: find a better and more reliable way to do this
-  // checking the `maps` file. this won't work well for forked processes
-  pid_t result = 0;
-  char *path = NULL, *content = NULL, *buf = NULL;
-  FILE *fp = NULL;
-  DIR *dp = NULL;
-  struct dirent *de = NULL, *rde = NULL;
-  size_t size, content_len, new_proc_len;
-
-  size = strlen(orig_proc) + sizeof(orig_pid) * 3 + sizeof("//maps") + 2;
-  path = malloc(size);
-  if (!path) goto cleanup;
-  snprintf(path, size, "%s/%ld/maps", orig_proc, (long) orig_pid);
-  content = fs_read(path, PROC_FILE_MAX_SIZE);
-  if (!content) goto cleanup;
-  content_len = strlen(content);
-
-  // enum pids in new_proc
-  dp = opendir(new_proc);
-  if (dp == NULL) goto cleanup;
-  new_proc_len = strlen(new_proc);
-
-  de = (struct dirent *)malloc(dirent_buf_size(dp));
-  if (!de) goto cleanup;
-
-  while (readdir_r(dp, de, &rde) == 0 && rde != NULL) {
-    long new_pid = 0;
-    if (sscanf(rde->d_name, "%ld", &new_pid) == 0) continue;
-
-    if (path) { free(path); path = NULL; }
-    size = new_proc_len + sizeof("//maps") + sizeof(new_pid) * 3 + 2;
-    path = malloc(size);
-    snprintf(path, size, "%s/%ld/maps", new_proc, (long) new_pid);
-
-    if (buf) { free(buf); buf = NULL; }
-    buf = fs_read(path, PROC_FILE_MAX_SIZE);
-    if (buf == NULL) continue;
-
-    if (strncmp(buf, content, content_len) == 0) {
-      result = new_pid;
-      goto cleanup;
-    }
-  }
-
-cleanup:
-  if (path) free(path);
-  if (content) free(content);
-  if (buf) free(buf);
-  if (de) free(de);
-  if (dp) closedir(dp);
-  if (fp) fclose(fp);
-  return result;
 }
 
 static char *get_cgroup_name() {
@@ -298,14 +226,18 @@ static int frefs_readlink(const char *path, char *buf, size_t size) {
   if (size == 0) return 0;
 
   // a special case, we need to translate pid
-  if (strcmp(path, "/proc/self") == 0) do {
+  if (strcmp(path, "/proc/self") == 0) {
     pid_t rpid = translate_proc_self_pid();
-    char rbuf[sizeof(pid_t) * 3 + 1];
-    snprintf(rbuf, sizeof rbuf, "%ld", (long) rpid);
-    if (size > sizeof(rbuf)) size = sizeof(rbuf);
-    memcpy(buf, rbuf, size);
-    return 0;
-  } while (0);
+    if (rpid > 0) {
+      char rbuf[sizeof(pid_t) * 3 + 1];
+      snprintf(rbuf, sizeof rbuf, "%ld", (long) rpid);
+      if (size > sizeof(rbuf)) size = sizeof(rbuf);
+      memcpy(buf, rbuf, size);
+      return 0;
+    } else {
+      return -ENOENT;
+    }
+  }
 
   with_rpath {
     int offset = 0;
