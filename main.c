@@ -80,7 +80,7 @@ static frefs_config_t config;
 #define checked_zero(exp) \
   ((exp) == -1 ? -errno : 0)
 
-static const size_t PROC_FILE_MAX_SIZE = 4096;
+static const size_t PROC_FILE_MAX_SIZE = 4095;
 
 char *fs_read(const char *path, size_t size) {
   char *result = NULL;
@@ -91,7 +91,8 @@ char *fs_read(const char *path, size_t size) {
 
   // note: fseek won't work on special files in /proc/
   // cannot use fseek, ftell to get file size
-  result = malloc(size);
+  result = malloc(size + 1);
+  memset(result, 0, size + 1);
   result[0] = 0;
   rewind(fp);
   fread(result, 1, size, fp);
@@ -147,7 +148,7 @@ pid_t translate_pid(pid_t orig_pid, const char *orig_proc, const char *new_proc)
   snprintf(path, size, "%s/%ld/maps", orig_proc, (long) orig_pid);
   content = fs_read(path, PROC_FILE_MAX_SIZE);
   if (!content) goto cleanup;
-  content_len = sizeof(content);
+  content_len = strlen(content);
 
   // enum pids in new_proc
   dp = opendir(new_proc);
