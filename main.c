@@ -320,7 +320,7 @@ static int frefs_readdir(const char *path, void *buf, fuse_fill_dir_t filler,off
         // it's '.' and '..', pass
       } else {
         // hide filtered entities
-        char *joined = path_join(rpath, rde->d_name);
+        char *joined = path_join(path, rde->d_name);
         int accessible = 0;
         if (joined) {  // not oom
           accessible = frefs_config_get_file_permission(&config, joined, FREFS_PERM_READ);
