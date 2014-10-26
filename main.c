@@ -43,6 +43,7 @@
 #include <strings.h>
 #include <string.h>
 #include <stdlib.h>
+#include <stddef.h>
 #include <string.h>
 #include <assert.h>
 #include <errno.h>
@@ -51,7 +52,7 @@
 #include <dirent.h>
 #include <unistd.h>
 #include <fuse.h>
-
+#include <limits.h>
 #include <linux/limits.h>
 
 #include "config.h"
@@ -120,6 +121,16 @@ static char *path_join(const char *dirname, const char *basename) {
   return result;
 }
 
+// http://womble.decadent.org.uk/readdir_r-advisory.html
+static size_t dirent_buf_size(DIR * dirp) {
+  static const size_t min_name_max = 512;
+  long name_max = fpathconf(dirfd(dirp), _PC_NAME_MAX);
+  if (name_max == -1) name_max = NAME_MAX;  // guess
+  if (name_max < min_name_max) name_max = min_name_max;
+  size_t name_end = (size_t)offsetof(struct dirent, d_name) + name_max + 1;
+  return (name_end > sizeof(struct dirent) ? name_end : sizeof(struct dirent));
+}
+
 pid_t translate_pid(pid_t orig_pid, const char *orig_proc, const char *new_proc) {
   // TODO: find a better and more reliable way to do this
   // checking the `maps` file. this won't work well for forked processes
@@ -127,10 +138,10 @@ pid_t translate_pid(pid_t orig_pid, const char *orig_proc, const char *new_proc)
   char *path = NULL, *content = NULL, *buf = NULL;
   FILE *fp = NULL;
   DIR *dp = NULL;
-  struct dirent *de = NULL;
+  struct dirent *de = NULL, *rde = NULL;
   size_t size, content_len, new_proc_len;
 
-  size = strlen(orig_proc) + sizeof(orig_pid) * 3 + sizeof("//maps") + 1;
+  size = strlen(orig_proc) + sizeof(orig_pid) * 3 + sizeof("//maps") + 2;
   path = malloc(size);
   if (!path) goto cleanup;
   snprintf(path, size, "%s/%ld/maps", orig_proc, (long) orig_pid);
@@ -143,12 +154,15 @@ pid_t translate_pid(pid_t orig_pid, const char *orig_proc, const char *new_proc)
   if (dp == NULL) goto cleanup;
   new_proc_len = strlen(new_proc);
 
-  while ((de = readdir(dp)) != NULL) {
+  de = (struct dirent *)malloc(dirent_buf_size(dp));
+  if (!de) goto cleanup;
+
+  while (readdir_r(dp, de, &rde) == 0 && rde != NULL) {
     long new_pid = 0;
-    if (sscanf(de->d_name, "%ld", &new_pid) == 0) continue;
+    if (sscanf(rde->d_name, "%ld", &new_pid) == 0) continue;
 
     if (path) { free(path); path = NULL; }
-    size = new_proc_len + sizeof("//maps") + sizeof(new_pid) * 3 + 1;
+    size = new_proc_len + sizeof("//maps") + sizeof(new_pid) * 3 + 2;
     path = malloc(size);
     snprintf(path, size, "%s/%ld/maps", new_proc, (long) new_pid);
 
@@ -166,8 +180,9 @@ cleanup:
   if (path) free(path);
   if (content) free(content);
   if (buf) free(buf);
-  if (fp) fclose(fp);
+  if (de) free(de);
   if (dp) closedir(dp);
+  if (fp) fclose(fp);
   return result;
 }
 
@@ -282,7 +297,7 @@ static int frefs_readlink(const char *path, char *buf, size_t size) {
 
 static int frefs_readdir(const char *path, void *buf, fuse_fill_dir_t filler,off_t offset, struct fuse_file_info *fi) {
   DIR *dp;
-  struct dirent *de;
+  struct dirent *de = NULL, *rde = NULL;
 
   (void) offset;
   (void) fi;
@@ -295,18 +310,16 @@ static int frefs_readdir(const char *path, void *buf, fuse_fill_dir_t filler,off
     dp = opendir(rpath);
     if (dp == NULL) { res = -errno; continue; }
 
-    while ((de = readdir(dp)) != NULL) {
-      struct stat st;
-      memset(&st, 0, sizeof(st));
-      st.st_ino = de->d_ino;
-      st.st_mode = de->d_type << 12;
+    de = (struct dirent *)malloc(dirent_buf_size(dp));
+    if (!de) { continue; };
 
-      int len = strlen(de->d_name);
-      if (len <= 2 && (de->d_name[0] == '.' && (len == 1 || de->d_name[1] == '.'))) {
+    while (readdir_r(dp, de, &rde) == 0 && rde != NULL) {
+      int len = strlen(rde->d_name);
+      if (len <= 2 && (rde->d_name[0] == '.' && (len == 1 || rde->d_name[1] == '.'))) {
         // it's '.' and '..', pass
       } else {
         // hide filtered entities
-        char *joined = path_join(rpath, de->d_name);
+        char *joined = path_join(rpath, rde->d_name);
         int accessible = 0;
         if (joined) {  // not oom
           accessible = frefs_config_get_file_permission(&config, joined, FREFS_PERM_READ);
@@ -314,8 +327,15 @@ static int frefs_readdir(const char *path, void *buf, fuse_fill_dir_t filler,off
         }
         if (!accessible) continue;
       }
-      if (filler(buf, de->d_name, &st, 0)) break;
+
+      struct stat st;
+      memset(&st, 0, sizeof(st));
+      st.st_ino = rde->d_ino;
+      st.st_mode = rde->d_type << 12;
+      if (filler(buf, rde->d_name, &st, 0)) break;
     }
+
+    free(de);
     closedir(dp);
   }
 
