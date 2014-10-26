@@ -711,6 +711,7 @@ static void print_usage(const char *progname) {
 
 enum {
   KEY_HELP,
+  KEY_COMMENT,
   KEY_VERSION,
   KEY_READABLE_CONFIG,
   KEY_WRITABLE_CONFIG,
@@ -727,6 +728,7 @@ static struct fuse_opt frefs_opts[] = {
   FUSE_OPT_KEY("-w %s",                KEY_WRITABLE_CONFIG),
   FUSE_OPT_KEY("--writable-config %s", KEY_WRITABLE_CONFIG),
   FUSE_OPT_KEY("--forward-cg-proc %s", KEY_FORWARD_CG_PROC),
+  FUSE_OPT_KEY("--comment %s",         KEY_COMMENT),
   FUSE_OPT_END
 };
 
@@ -757,6 +759,8 @@ static int frefs_parse_opt(void *data, const char *arg, int key, struct fuse_arg
       if (forward_cg_proc_path[forward_cg_proc_path_len - 1] == '/') {
         forward_cg_proc_path[--forward_cg_proc_path_len] = 0;
       }
+      return 0;
+    case KEY_COMMENT:
       return 0;
     case FUSE_OPT_KEY_NONOPT:
       if (!dest) {
