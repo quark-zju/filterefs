@@ -148,17 +148,24 @@ static char *get_cgroup_name() {
 }
 
 static const char *translate_path(const char *path) {
-  if (!forward_cg_proc_path || strncmp(path, "/proc", 5) != 0)
-    return path;
-  char *cgname = get_cgroup_name();
-  if (cgname == NULL) return path;
+  const char *result = path;
+  char *cgname = NULL;
+  if (!forward_cg_proc_path || strncmp(path, "/proc", 5) != 0) goto cleanup;
+
+  cgname = get_cgroup_name();
+  if (cgname == NULL) goto cleanup;
 
   int rpath_size = strlen(cgname) + forward_cg_proc_path_len + strlen(path) + 2;
   char *rpath = malloc(rpath_size);
+  // test it
+  snprintf(rpath, rpath_size, "%s/%s", forward_cg_proc_path, cgname);
+  if (access(rpath, F_OK) != 0) goto cleanup;
   snprintf(rpath, rpath_size, "%s/%s%s", forward_cg_proc_path, cgname, path);
-  free(cgname);
+  result = rpath;
 
-  return rpath;
+cleanup:
+  if (cgname) free(cgname);
+  return result;
 }
 
 static inline int free_rpath(const char **prpath, const char *path) {
