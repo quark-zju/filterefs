@@ -1,5 +1,5 @@
 CC?=gcc
-CFLAGS?=-Wall -O2
+CFLAGS?=-Wall -Os
 #-DNDEBUG
 PREFIX?=/usr/local
 GIT_VERSION:=$(shell [ -e .git ] && git describe --abbrev=4 --tags --always --dirty)

@@ -65,8 +65,10 @@
 // configuration
 static char *readable_config_path = NULL;
 static char *writable_config_path = NULL;
+#ifdef EXPERIMENT
 static char *forward_cg_proc_path = NULL;
 static int forward_cg_proc_path_len = 0;
+#endif
 static char *dest = NULL;
 
 static frefs_config_t config;
@@ -115,6 +117,7 @@ size_t dirent_buf_size(DIR * dirp) {
   return (name_end > sizeof(struct dirent) ? name_end : sizeof(struct dirent));
 }
 
+#ifdef EXPERIMENT
 static char *get_cgroup_name() {
   char *result = NULL;
 
@@ -178,6 +181,13 @@ static inline int free_rpath(const char **prpath, const char *path) {
   int res = 0; const char *rpath; for (rpath = translate_path(path); rpath; free_rpath(&rpath, path))
 #define with_rfrom_rto \
   int res = 0; const char *rfrom, *rto; for (rfrom = translate_path(from), rto = translate_path(to); rfrom; free_rpath(&rfrom, from), free_rpath(&rto, to))
+#else
+#define with_rpath \
+  int res = 0; const char *rpath = path; for (; rpath; rpath = NULL)
+#define with_rfrom_rto \
+  int res = 0; const char *rfrom = from, *rto = to; for (; rfrom; rfrom = NULL)
+
+#endif
 
 static int frefs_getattr(const char *path, struct stat *st_data) {
   INFO("%s %s", __func__, path);
@@ -197,6 +207,7 @@ static int frefs_getattr(const char *path, struct stat *st_data) {
   return checked_zero(res);
 }
 
+#ifdef EXPERIMENT
 static pid_t translate_proc_self_pid() {
   static char *proc = "/proc";
   const char *rproc = translate_path(proc);
@@ -225,6 +236,7 @@ static int should_translate_chroot(const char *path) {
   if (strcmp(p, "/root") == 0) return 2;
   return 0;
 }
+#endif
 
 static int frefs_readlink(const char *path, char *buf, size_t size) {
   INFO("%s %s", __func__, path);
@@ -232,6 +244,7 @@ static int frefs_readlink(const char *path, char *buf, size_t size) {
   ensure_read_perm(path);
   if (size == 0) return 0;
 
+#ifdef EXPERIMENT
   // a special case, we need to translate pid
   if (strcmp(path, "/proc/self") == 0) {
     pid_t rpid = translate_proc_self_pid();
@@ -245,8 +258,10 @@ static int frefs_readlink(const char *path, char *buf, size_t size) {
       return -ENOENT;
     }
   }
+#endif
 
   with_rpath {
+#ifdef EXPERIMENT
     int offset = 0;
     switch (should_translate_chroot(path)) {
       case 2:
@@ -293,8 +308,11 @@ static int frefs_readlink(const char *path, char *buf, size_t size) {
       }
       free(rbuf);
     } else {
+#endif
       res = readlink(rpath, buf, size > 0 ? size - 1 : size);
+#ifdef EXPERIMENT
     }
+#endif
     // FUSE uses strlen so we have to write a '\0'
     if (res != -1 && res < size) buf[res] = 0;
   }
@@ -518,6 +536,7 @@ static int frefs_read(const char *path, char *buf, size_t size, off_t offset, st
   // ensure_read_perm(path);
 
   with_rpath {
+#ifdef EXPERIMENT
     int skip = 0;
 
     if (forward_cg_proc_path && strncmp(path, "/proc/", sizeof("/proc/") - 1) == 0) {
@@ -532,6 +551,7 @@ static int frefs_read(const char *path, char *buf, size_t size, off_t offset, st
     }
 
     if (skip) continue;
+#endif
 
     int fd = open(rpath, O_RDONLY);
     if (fd == -1) { res = -errno; continue; }
@@ -728,7 +748,9 @@ enum {
   KEY_VERSION,
   KEY_READABLE_CONFIG,
   KEY_WRITABLE_CONFIG,
+#ifdef EXPERIMENT
   KEY_FORWARD_CG_PROC,
+#endif
 };
 
 static struct fuse_opt frefs_opts[] = {
@@ -740,7 +762,9 @@ static struct fuse_opt frefs_opts[] = {
   FUSE_OPT_KEY("--readable-config %s", KEY_READABLE_CONFIG),
   FUSE_OPT_KEY("-w %s",                KEY_WRITABLE_CONFIG),
   FUSE_OPT_KEY("--writable-config %s", KEY_WRITABLE_CONFIG),
+#ifdef EXPERIMENT
   FUSE_OPT_KEY("--forward-cg-proc %s", KEY_FORWARD_CG_PROC),
+#endif
   FUSE_OPT_KEY("--comment %s",         KEY_COMMENT),
   FUSE_OPT_END
 };
@@ -765,6 +789,7 @@ static int frefs_parse_opt(void *data, const char *arg, int key, struct fuse_arg
       if (writable_config_path) free(writable_config_path);
       writable_config_path = strdup(arg + (arg[1] == '-' ? 17 : 2));
       return 0;
+#ifdef EXPERIMENT
     case KEY_FORWARD_CG_PROC:
       if (forward_cg_proc_path) free(forward_cg_proc_path);
       forward_cg_proc_path = strdup(arg + 17);
@@ -773,6 +798,7 @@ static int frefs_parse_opt(void *data, const char *arg, int key, struct fuse_arg
         forward_cg_proc_path[--forward_cg_proc_path_len] = 0;
       }
       return 0;
+#endif
     case KEY_COMMENT:
       return 0;
     case FUSE_OPT_KEY_NONOPT:
