@@ -694,7 +694,6 @@ static void print_usage(const char *progname) {
       "                         if missing, everything is readable.\n"
       "  -w  --writable-config  writable config file path.\n"
       "                         if missing, nothing is writable.\n"
-      "  --forward-cg-proc      forward /proc access. see notes below.\n"
       "  -o  opt,[opt...]       fuse mount options can be used.\n"
       "  -h  --help             print help\n"
       "  -V  --version          print version\n"
@@ -719,11 +718,6 @@ static void print_usage(const char *progname) {
       "  does not care about directory permissions. You can delete\n"
       "  /a/b if \"/a/b\" is in writable whitelist and not in blacklist,\n"
       "  directory \"/a/\" is not checked.\n"
-      "\n"
-      "--forward-cg-proc:\n"
-      "  This is intended to work with pid namespaces.\n"
-      "  With `--forward-cg-proc /A`, when a program in memory cgroup B\n"
-      "  tries to access /proc/C, it will be forwarded to /A/B/proc/C.\n"
       "\n"
       "", progname);
 }
