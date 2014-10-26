@@ -61,6 +61,8 @@
 // configuration
 static char *readable_config_path = NULL;
 static char *writable_config_path = NULL;
+static char *forward_cg_proc_path = NULL;
+static int forward_cg_proc_path_len = 0;
 static char *dest = NULL;
 
 static frefs_config_t config;
@@ -69,36 +71,23 @@ static frefs_config_t config;
 #define ensure_read_perm(path) \
   if (!frefs_config_get_file_permission(&config, path, FREFS_PERM_READ)) { return -ENOENT; }
 #define ensure_write_perm(path) \
-  { int perm = frefs_config_get_file_permission(&config, path, FREFS_PERM_READ | FREFS_PERM_WRITE); \
-    if (perm == FREFS_PERM_READ) return -EPERM; \
-    else if (perm == 0) return -ENOENT; }
-#define return_checked(exp) \
-  { int _ret = (exp); return _ret == -1 ? -errno : _ret; }
-#define return_checked_zero(exp) \
-  { int _ret = (exp); return _ret == -1 ? -errno : 0; }
+{ int perm = frefs_config_get_file_permission(&config, path, FREFS_PERM_READ | FREFS_PERM_WRITE); \
+  if (perm == FREFS_PERM_READ) return -EPERM; \
+  else if (perm == 0) return -ENOENT; }
+#define checked(exp) \
+  ((exp) == -1 ? -errno : (exp))
+#define checked_zero(exp) \
+  ((exp) == -1 ? -errno : 0)
 
 
-static const char *path_join(const char *dirname, const char *basename) {
-  static char *result = NULL;
-  static size_t last_size = 0;
-
-  if (!dirname || dirname[0] == 0) return basename;
+static char *path_join(const char *dirname, const char *basename) {
+  if (!dirname || dirname[0] == 0) return strdup(basename);
 
   int dir_len = strlen(dirname);
   int base_len = strlen(basename);
-  size_t size = dir_len + base_len + 2;
+  char *result = malloc(dir_len + base_len + 2);
 
-  if (size > last_size || last_size == 0) {
-    char *new_alloc = realloc(result, dir_len + base_len + 2);
-    if (new_alloc) {
-      result = new_alloc;
-    } else {
-      /* oom */
-      abort();
-    }
-    last_size = size;
-  }
-
+  if (!result) return NULL;  // oom
   strcpy(result, dirname);
 
   // check '/'
@@ -111,13 +100,72 @@ static const char *path_join(const char *dirname, const char *basename) {
   return result;
 }
 
+static char *get_cgroup_name() {
+  char *result = NULL;
+
+  // lookup /proc/pid/cgroup
+  pid_t pid = fuse_get_context()->pid;
+  char path[sizeof(long) * 3 + sizeof("/proc//cgroup")];
+  snprintf(path, sizeof(path), "/proc/%ld/cgroup", (long)pid);
+  FILE *fp = fopen(path, "r");
+  if (!fp) return NULL;
+
+  char *line = NULL;
+  size_t len = 0;
+  while (getline(&line, &len, fp) != -1) {
+    // the line should look like:
+    // 4:memory:/cgname
+    char *p = strchr(line, ':');
+    if (p == NULL) continue;
+    if (strncmp(p, ":memory:/", sizeof(":memory:/") - 1) != 0) continue;
+    if (p[sizeof(":memory:/") - 1] != '\n' && p[sizeof(":memory:/") - 1] != '\0') {
+      // we got the non-empty memory cgname
+      result = strdup(p + sizeof(":memory:/") - 1);
+      // chomp
+      int len = strlen(result);
+      if (len && result[len - 1] == '\n') result[len - 1] = 0;
+    }
+    break;
+  }
+  if (line) free(line);
+  fclose(fp);
+  return result;
+}
+
+static const char *translate_path(const char *path) {
+  if (!forward_cg_proc_path || strncmp(path, "/proc", 5) != 0)
+    return path;
+  char *cgname = get_cgroup_name();
+  if (cgname == NULL) return path;
+
+  int rpath_size = strlen(cgname) + forward_cg_proc_path_len + strlen(path) + 2;
+  char *rpath = malloc(rpath_size);
+  snprintf(rpath, rpath_size, "%s/%s%s", forward_cg_proc_path, cgname, path);
+  free(cgname);
+
+  return rpath;
+}
+
+static inline int free_rpath(const char **prpath, const char *path) {
+  if (*prpath && *prpath != path) free((char *)*prpath);
+  *prpath = NULL;
+  return 0;
+}
+
+#define with_rpath \
+  int res = 0; const char *rpath; for (rpath = translate_path(path); rpath; free_rpath(&rpath, path))
+#define with_rfrom_rto \
+  int res = 0; const char *rfrom, *rto; for (rfrom = translate_path(from), rto = translate_path(to); rfrom; free_rpath(&rfrom, from), free_rpath(&rto, to))
 
 static int frefs_getattr(const char *path, struct stat *st_data) {
   INFO("%s %s", __func__, path);
 
   ensure_read_perm(path);
 
-  return_checked_zero(lstat(path, st_data));
+  with_rpath {
+    res = lstat(rpath, st_data);
+  }
+  return checked_zero(res);
 }
 
 static int frefs_readlink(const char *path, char *buf, size_t size) {
@@ -125,10 +173,11 @@ static int frefs_readlink(const char *path, char *buf, size_t size) {
 
   ensure_read_perm(path);
 
-  int res = readlink(path, buf, size - 1);
-  if (res == -1) { return -errno; }
-  buf[res] = '\0';
-  return 0;
+  with_rpath {
+    res = readlink(rpath, buf, size - 1);
+    if (res != -1) buf[res] = '\0';
+  }
+  return checked_zero(res);
 }
 
 static int frefs_readdir(const char *path, void *buf, fuse_fill_dir_t filler,off_t offset, struct fuse_file_info *fi) {
@@ -141,27 +190,36 @@ static int frefs_readdir(const char *path, void *buf, fuse_fill_dir_t filler,off
   INFO("%s %s", __func__, path);
   ensure_read_perm(path);
 
-  dp = opendir(path);
-  if (dp == NULL) { return -errno; }
+  with_rpath {
 
-  while ((de = readdir(dp)) != NULL) {
-    struct stat st;
-    memset(&st, 0, sizeof(st));
-    st.st_ino = de->d_ino;
-    st.st_mode = de->d_type << 12;
+    dp = opendir(rpath);
+    if (dp == NULL) { res = -errno; continue; }
 
-    int len = strlen(de->d_name);
-    if (len <= 2 && (de->d_name[0] == '.' && (len == 1 || de->d_name[1] == '.'))) {
-      // it's '.' and '..', pass
-    } else {
-      // hide filtered entities
-      if (!frefs_config_get_file_permission(&config, path_join(path, de->d_name), FREFS_PERM_READ)) continue;
+    while ((de = readdir(dp)) != NULL) {
+      struct stat st;
+      memset(&st, 0, sizeof(st));
+      st.st_ino = de->d_ino;
+      st.st_mode = de->d_type << 12;
+
+      int len = strlen(de->d_name);
+      if (len <= 2 && (de->d_name[0] == '.' && (len == 1 || de->d_name[1] == '.'))) {
+        // it's '.' and '..', pass
+      } else {
+        // hide filtered entities
+        char *joined = path_join(rpath, de->d_name);
+        int accessible = 0;
+        if (joined) {  // not oom
+          accessible = frefs_config_get_file_permission(&config, joined, FREFS_PERM_READ);
+          free(joined);
+        }
+        if (!accessible) continue;
+      }
+      if (filler(buf, de->d_name, &st, 0)) break;
     }
-    if (filler(buf, de->d_name, &st, 0)) break;
+    closedir(dp);
   }
 
-  closedir(dp);
-  return 0;
+  return res;
 }
 
 static int frefs_mknod(const char *path, mode_t mode, dev_t rdev) {
@@ -169,27 +227,29 @@ static int frefs_mknod(const char *path, mode_t mode, dev_t rdev) {
 
   ensure_write_perm(path);
 
-  int res;
-
-  // On Linux this could just be 'mknod(path, mode, rdev)' but this is more portable
-  if (S_ISREG(mode)) {
-    res = open(path, O_CREAT | O_EXCL | O_WRONLY, mode);
-    if (res >= 0) { res = close(res); }
-  } else if (S_ISFIFO(mode)) {
-    res = mkfifo(path, mode);
-  } else {
-    res = mknod(path, mode, rdev);
+  with_rpath {
+    // On Linux this could just be 'mknod(path, mode, rdev)' but this is more portable
+    if (S_ISREG(mode)) {
+      res = open(rpath, O_CREAT | O_EXCL | O_WRONLY, mode);
+      if (res >= 0) { res = close(res); }
+    } else if (S_ISFIFO(mode)) {
+      res = mkfifo(rpath, mode);
+    } else {
+      res = mknod(rpath, mode, rdev);
+    }
   }
 
-  return_checked_zero(res);
+  return checked_zero(res);
 }
 
 static int frefs_mkdir(const char *path, mode_t mode) {
   INFO("%s %s", __func__, path);
 
   ensure_write_perm(path);
-
-  return_checked_zero(mkdir(path, mode));
+  with_rpath {
+    res = mkdir(rpath, mode);
+  }
+  return checked_zero(res);
 }
 
 static int frefs_unlink(const char *path) {
@@ -197,15 +257,21 @@ static int frefs_unlink(const char *path) {
 
   ensure_write_perm(path);
 
-  return_checked_zero(unlink(path));
+  with_rpath {
+    res = unlink(rpath);
+  }
+  return checked_zero(res);
 }
 
 static int frefs_rmdir(const char *path) {
   INFO("%s %s", __func__, path);
 
   ensure_write_perm(path);
+  with_rpath {
+    res = rmdir(rpath);
+  }
 
-  return_checked_zero(rmdir(path));
+  return checked_zero(res);
 }
 
 static int frefs_symlink(const char *from, const char *to) {
@@ -214,7 +280,11 @@ static int frefs_symlink(const char *from, const char *to) {
   ensure_read_perm(from);
   ensure_write_perm(to);
 
-  return_checked_zero(symlink(from, to));
+  with_rfrom_rto {
+    res = symlink(rfrom, rto);
+  }
+
+  return checked_zero(res);
 }
 
 static int frefs_rename(const char *from, const char *to) {
@@ -223,7 +293,11 @@ static int frefs_rename(const char *from, const char *to) {
   ensure_write_perm(from);
   ensure_write_perm(to);
 
-  return_checked_zero(rename(from, to));
+  with_rfrom_rto {
+    res = rename(rfrom, rto);
+  }
+
+  return checked_zero(res);
 }
 
 static int frefs_link(const char *from, const char *to) {
@@ -232,7 +306,11 @@ static int frefs_link(const char *from, const char *to) {
   ensure_read_perm(from);
   ensure_write_perm(to);
 
-  return_checked_zero(link(from, to));
+  with_rfrom_rto {
+    res = link(rfrom, rto);
+  }
+
+  return checked_zero(res);
 }
 
 static int frefs_chmod(const char *path, mode_t mode) {
@@ -240,7 +318,11 @@ static int frefs_chmod(const char *path, mode_t mode) {
 
   ensure_write_perm(path);
 
-  return_checked_zero(chmod(path, mode));
+  with_rpath {
+    res = chmod(rpath, mode);
+  }
+
+  return checked_zero(res);
 }
 
 static int frefs_chown(const char *path, uid_t uid, gid_t gid) {
@@ -248,7 +330,11 @@ static int frefs_chown(const char *path, uid_t uid, gid_t gid) {
 
   ensure_write_perm(path);
 
-  return_checked_zero(lchown(path, uid, gid));
+  with_rpath {
+    res = lchown(rpath, uid, gid);
+  }
+
+  return checked_zero(res);
 }
 
 static int frefs_truncate(const char *path, off_t size) {
@@ -256,7 +342,11 @@ static int frefs_truncate(const char *path, off_t size) {
 
   ensure_write_perm(path);
 
-  return_checked_zero(truncate(path, size));
+  with_rpath {
+    res = truncate(rpath, size);
+  }
+
+  return checked_zero(res);
 }
 
 static int frefs_utimens(const char *path, const struct timespec ts[2]) {
@@ -264,7 +354,11 @@ static int frefs_utimens(const char *path, const struct timespec ts[2]) {
 
   ensure_write_perm(path);
 
-  return_checked_zero(utimensat(0, path, ts, AT_SYMLINK_NOFOLLOW));
+  with_rpath {
+    res = utimensat(0, rpath, ts, AT_SYMLINK_NOFOLLOW);
+  }
+
+  return checked_zero(res);
 }
 
 static int frefs_open(const char *path, struct fuse_file_info *finfo) {
@@ -277,14 +371,16 @@ static int frefs_open(const char *path, struct fuse_file_info *finfo) {
     ensure_read_perm(path);
   }
 
-  int fd = open(path, finfo->flags);
+  with_rpath {
+    res = open(rpath, finfo->flags);
 
-  // About the return value of `close`:
-  // According to https://lkml.org/lkml/2002/7/17/165, the kernel, at least Linux,
-  // _will_ close the file descriptor no matter the return value is.
-  // We wrote nothing therefore just ignore the value.
-  if (fd != -1) close(fd);
-  return_checked_zero(fd);
+    // About the return value of `close`:
+    // According to https://lkml.org/lkml/2002/7/17/165, the kernel, at least Linux,
+    // _will_ close the file descriptor no matter the return value is.
+    // We wrote nothing therefore just ignore the value.
+    if (res != -1) close(res);
+  }
+  return checked_zero(res);
 }
 
 static int frefs_read(const char *path, char *buf, size_t size, off_t offset, struct fuse_file_info *finfo) {
@@ -295,12 +391,14 @@ static int frefs_read(const char *path, char *buf, size_t size, off_t offset, st
   // This check is skipped for performance. `open` will do the actual check.
   // ensure_read_perm(path);
 
-  int fd = open(path, O_RDONLY);
-  if (fd == -1) { return -errno; }
+  with_rpath{
+    int fd = open(rpath, O_RDONLY);
+    if (fd == -1) { res = -errno; continue; }
 
-  int res = pread(fd, buf, size, offset);
-  close(fd);
-  return_checked(res);
+    res = pread(fd, buf, size, offset);
+    close(fd);
+  }
+  return checked(res);
 }
 
 static int frefs_write(const char *path, const char *buf, size_t size, off_t offset, struct fuse_file_info *finfo) {
@@ -311,13 +409,15 @@ static int frefs_write(const char *path, const char *buf, size_t size, off_t off
   // For the same reason as frefs_read, skip the check.
   // ensure_write_perm(path);
 
-	int fd = open(path, O_WRONLY);
-	if (fd == -1) { return -errno; }
+  with_rpath{
+    int fd = open(rpath, O_WRONLY);
+    if (fd == -1) { res = -errno; continue; }
 
-	int res = pwrite(fd, buf, size, offset);
-  // FIXME: potential unawared data loss
-  close(fd);
-	return_checked(res);
+    res = pwrite(fd, buf, size, offset);
+    // FIXME: potential unawared data loss
+    close(fd);
+  }
+  return checked(res);
 }
 
 static int frefs_statfs(const char *path, struct statvfs *st_buf) {
@@ -325,7 +425,11 @@ static int frefs_statfs(const char *path, struct statvfs *st_buf) {
 
   ensure_read_perm(path);
 
-  return_checked_zero(statvfs(path, st_buf));
+  with_rpath {
+    res = statvfs(rpath, st_buf);
+  }
+
+  return checked_zero(res);
 }
 
 static int frefs_release(const char *path, struct fuse_file_info *finfo) {
@@ -348,16 +452,19 @@ static int frefs_fsync(const char *path, int crap, struct fuse_file_info *finfo)
 static int frefs_access(const char *path, int mode) {
   INFO("%s %s", __func__, path);
 
-  int res = access(path, mode);
-  if (res == -1) return -errno;
-
-  // check again using our filters
-  if (!frefs_config_get_file_permission(&config, path, FREFS_PERM_READ) ||
-      ((mode & W_OK) && !frefs_config_get_file_permission(&config, path, FREFS_PERM_WRITE))) {
-    return -EPERM;
+  with_rpath {
+    res = access(rpath, mode);
   }
 
-  return res;
+  if (res == 0) {
+    // check again using our filters
+    if (!frefs_config_get_file_permission(&config, path, FREFS_PERM_READ) ||
+        ((mode & W_OK) && !frefs_config_get_file_permission(&config, path, FREFS_PERM_WRITE))) {
+      return -EPERM;
+    }
+  }
+
+  return checked_zero(res);
 }
 
 static int frefs_setxattr(const char *path, const char *name, const char *value, size_t size, int flags) {
@@ -365,7 +472,11 @@ static int frefs_setxattr(const char *path, const char *name, const char *value,
 
   ensure_write_perm(path);
 
-  return_checked_zero(lsetxattr(path, name, value, size, flags));
+  with_rpath {
+    res = lsetxattr(rpath, name, value, size, flags);
+  }
+
+  return checked_zero(res);
 }
 
 static int frefs_getxattr(const char *path, const char *name, char *value, size_t size) {
@@ -373,7 +484,11 @@ static int frefs_getxattr(const char *path, const char *name, char *value, size_
 
   ensure_read_perm(path);
 
-  return_checked(lgetxattr(path, name, value, size));
+  with_rpath {
+    res = lgetxattr(rpath, name, value, size);
+  }
+
+  return checked(res);
 }
 
 static int frefs_listxattr(const char *path, char *list, size_t size) {
@@ -381,15 +496,22 @@ static int frefs_listxattr(const char *path, char *list, size_t size) {
 
   ensure_read_perm(path);
 
-  return_checked(llistxattr(path, list, size));
+  with_rpath {
+    res = llistxattr(rpath, list, size);
+  }
+
+  return checked(res);
 }
 
 static int frefs_removexattr(const char *path, const char *name) {
   INFO("%s %s", __func__, path);
 
   ensure_write_perm(path);
+  with_rpath {
+    res = lremovexattr(rpath, name);
+  }
 
-  return_checked_zero(lremovexattr(path, name));
+  return checked_zero(res);
 }
 
 struct fuse_operations frefs_oper = {
@@ -423,39 +545,47 @@ struct fuse_operations frefs_oper = {
 
 static void print_usage(const char *progname) {
   fprintf(stderr,
-    "usage: %s mountpoint options\n"
-    "\n"
-    "  Mounts / with regular expression filters at mountpoint\n"
-    "\n"
-    "options:\n"
-    "  -r  --readable-config  readable config file path.\n"
-    "                         if missing, everything is readable.\n"
-    "  -w  --writable-config  writable config file path.\n"
-    "                         if missing, nothing is writable.\n"
-    "  -o  opt,[opt...]       fuse mount options can be used.\n"
-    "  -h  --help             print help\n"
-    "  -V  --version          print version\n"
-    "\n"
-    "config file format:\n"
-    "  A config file consists of many lines, and:\n"
-    "\n"
-    "    - lines which are blank or start with '#' are ignored.\n"
-    "    - other lines are either:\n"
-    "      - regular expression (whitelist)\n"
-    "      - '!' + regular expression (blacklist)\n"
-    "\n"
-    "  Only POSIX extended regular expressions are supported.\n"
-    "  Regular expressions will be matched against absolute paths.\n"
-    "  (ex. \"/dev(/(full|null|zero))?\")\n"
-    "\n"
-    "  If a config file path starts with \"re://\" and follows a\n"
-    "  string R, it is considered the same as a file containing R.\n"
-    "  Using this you can avoid creating real config files.\n"
-    "\n"
-    "  Note that filterefs checks everything using full path and\n"
-    "  does not care about directory permissions. You can delete\n"
-    "  /a/b if \"/a/b\" is in writable whitelist and not in blacklist,\n"
-    "  directory \"/a/\" is not checked.\n\n", progname);
+      "usage: %s mountpoint options\n"
+      "\n"
+      "  Mounts / with regular expression filters at mountpoint\n"
+      "\n"
+      "options:\n"
+      "  -r  --readable-config  readable config file path.\n"
+      "                         if missing, everything is readable.\n"
+      "  -w  --writable-config  writable config file path.\n"
+      "                         if missing, nothing is writable.\n"
+      "  --forward-cg-proc      forward /proc access. see notes below.\n"
+      "  -o  opt,[opt...]       fuse mount options can be used.\n"
+      "  -h  --help             print help\n"
+      "  -V  --version          print version\n"
+      "\n"
+      "config file format:\n"
+      "  A config file consists of many lines, and:\n"
+      "\n"
+      "    - lines which are blank or start with '#' are ignored.\n"
+      "    - other lines are either:\n"
+      "      - regular expression (whitelist)\n"
+      "      - '!' + regular expression (blacklist)\n"
+      "\n"
+      "  Only POSIX extended regular expressions are supported.\n"
+      "  Regular expressions will be matched against absolute paths.\n"
+      "  (ex. \"/dev(/(full|null|zero))?\")\n"
+      "\n"
+      "  If a config file path starts with \"re://\" and follows a\n"
+      "  string R, it is considered the same as a file containing R.\n"
+      "  Using this you can avoid creating real config files.\n"
+      "\n"
+      "  Note that filterefs checks everything using full path and\n"
+      "  does not care about directory permissions. You can delete\n"
+      "  /a/b if \"/a/b\" is in writable whitelist and not in blacklist,\n"
+      "  directory \"/a/\" is not checked.\n"
+      "\n"
+      "--forward-cg-proc:\n"
+      "  This is intended to work with pid namespaces.\n"
+      "  With `--forward-cg-proc /A`, when a program in memory cgroup B\n"
+      "  tries to access /proc/C, it will be forwarded to /A/B/proc/C.\n"
+      "\n"
+      "", progname);
 }
 
 enum {
@@ -463,6 +593,7 @@ enum {
   KEY_VERSION,
   KEY_READABLE_CONFIG,
   KEY_WRITABLE_CONFIG,
+  KEY_FORWARD_CG_PROC,
 };
 
 static struct fuse_opt frefs_opts[] = {
@@ -474,6 +605,7 @@ static struct fuse_opt frefs_opts[] = {
   FUSE_OPT_KEY("--readable-config %s", KEY_READABLE_CONFIG),
   FUSE_OPT_KEY("-w %s",                KEY_WRITABLE_CONFIG),
   FUSE_OPT_KEY("--writable-config %s", KEY_WRITABLE_CONFIG),
+  FUSE_OPT_KEY("--forward-cg-proc %s", KEY_FORWARD_CG_PROC),
   FUSE_OPT_END
 };
 
@@ -490,10 +622,20 @@ static int frefs_parse_opt(void *data, const char *arg, int key, struct fuse_arg
       fprintf(stdout, "filterefs %s\n", FREFS_VERSION);
       exit(0);
     case KEY_READABLE_CONFIG:
+      if (readable_config_path) free(readable_config_path);
       readable_config_path = strdup(arg + (arg[1] == '-' ? 17 : 2));
       return 0;
     case KEY_WRITABLE_CONFIG:
+      if (writable_config_path) free(writable_config_path);
       writable_config_path = strdup(arg + (arg[1] == '-' ? 17 : 2));
+      return 0;
+    case KEY_FORWARD_CG_PROC:
+      if (forward_cg_proc_path) free(forward_cg_proc_path);
+      forward_cg_proc_path = strdup(arg + 17);
+      forward_cg_proc_path_len = strlen(forward_cg_proc_path);
+      if (forward_cg_proc_path[forward_cg_proc_path_len - 1] == '/') {
+        forward_cg_proc_path[--forward_cg_proc_path_len] = 0;
+      }
       return 0;
     case FUSE_OPT_KEY_NONOPT:
       if (!dest) {
@@ -503,9 +645,9 @@ static int frefs_parse_opt(void *data, const char *arg, int key, struct fuse_arg
       // intentional no break
     default:
       fprintf(stderr,
-        "unknown argument: %s\n"
-        "see `%s -h' for usage\n",
-        arg, outargs->argv[0]);
+          "unknown argument: %s\n"
+          "see `%s -h' for usage\n",
+          arg, outargs->argv[0]);
       exit(1);
   }
 
