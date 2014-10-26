@@ -79,6 +79,26 @@ static frefs_config_t config;
 #define checked_zero(exp) \
   ((exp) == -1 ? -errno : 0)
 
+static const size_t PROC_FILE_MAX_SIZE = 4096;
+
+char *fs_read(const char *path, size_t size) {
+  char *result = NULL;
+  FILE *fp = NULL;
+
+  fp = fopen(path, "r");
+  if (!fp) goto cleanup;
+
+  // note: fseek won't work on special files in /proc/
+  // cannot use fseek, ftell to get file size
+  result = malloc(size);
+  result[0] = 0;
+  rewind(fp);
+  fread(result, 1, size, fp);
+
+cleanup:
+  if (fp) fclose(fp);
+  return result;
+}
 
 static char *path_join(const char *dirname, const char *basename) {
   if (!dirname || dirname[0] == 0) return strdup(basename);
@@ -97,6 +117,57 @@ static char *path_join(const char *dirname, const char *basename) {
   if (offset > 0) result[dir_len] = '/';
   strcpy(result + dir_len + offset, basename);
 
+  return result;
+}
+
+pid_t translate_pid(pid_t orig_pid, const char *orig_proc, const char *new_proc) {
+  // TODO: find a better and more reliable way to do this
+  // checking the `maps` file. this won't work well for forked processes
+  pid_t result = 0;
+  char *path = NULL, *content = NULL, *buf = NULL;
+  FILE *fp = NULL;
+  DIR *dp = NULL;
+  struct dirent *de = NULL;
+  size_t size, content_len, new_proc_len;
+
+  size = strlen(orig_proc) + sizeof(orig_pid) * 3 + sizeof("//maps") + 1;
+  path = malloc(size);
+  if (!path) goto cleanup;
+  snprintf(path, size, "%s/%ld/maps", orig_proc, (long) orig_pid);
+  content = fs_read(path, PROC_FILE_MAX_SIZE);
+  if (!content) goto cleanup;
+  content_len = sizeof(content);
+
+  // enum pids in new_proc
+  dp = opendir(new_proc);
+  if (dp == NULL) goto cleanup;
+  new_proc_len = strlen(new_proc);
+
+  while ((de = readdir(dp)) != NULL) {
+    long new_pid = 0;
+    if (sscanf(de->d_name, "%ld", &new_pid) == 0) continue;
+
+    if (path) { free(path); path = NULL; }
+    size = new_proc_len + sizeof("//maps") + sizeof(new_pid) * 3 + 1;
+    path = malloc(size);
+    snprintf(path, size, "%s/%ld/maps", new_proc, (long) new_pid);
+
+    if (buf) { free(buf); buf = NULL; }
+    buf = fs_read(path, PROC_FILE_MAX_SIZE);
+    if (buf == NULL) continue;
+
+    if (strncmp(buf, content, content_len) == 0) {
+      result = new_pid;
+      goto cleanup;
+    }
+  }
+
+cleanup:
+  if (path) free(path);
+  if (content) free(content);
+  if (buf) free(buf);
+  if (fp) fclose(fp);
+  if (dp) closedir(dp);
   return result;
 }
 
@@ -165,6 +236,13 @@ static int frefs_getattr(const char *path, struct stat *st_data) {
   with_rpath {
     res = lstat(rpath, st_data);
   }
+
+  // fake file size for /proc files. this will prevent FUSE from returning empty files
+  if (strncmp(path, "/proc/", sizeof("/proc/") - 1) == 0 && S_ISREG(st_data->st_mode)) {
+    // assuming /proc files are not larger than this number
+    st_data->st_size = PROC_FILE_MAX_SIZE;
+  }
+
   return checked_zero(res);
 }
 
@@ -173,9 +251,31 @@ static int frefs_readlink(const char *path, char *buf, size_t size) {
 
   ensure_read_perm(path);
 
+  // a special case, we need to translate pid
+  if (strcmp(path, "/proc/self") == 0) do {
+    static char *proc = "/proc";
+    const char *rproc = translate_path(proc);
+    pid_t rpid;
+    if (rproc && rproc != proc) {
+      // translate it between pid namespaces
+      rpid = translate_pid(fuse_get_context()->pid, "/proc", rproc);
+    } else {
+      // we are in the same pid ns
+      rpid = fuse_get_context()->pid;
+    }
+    free_rpath(&rproc, proc);
+    if (!rpid) break;
+
+    char rbuf[sizeof(pid_t) * 3 + 1];
+    snprintf(rbuf, sizeof rbuf, "%ld", (long) rpid);
+    if (size > sizeof(rbuf)) size = sizeof(rbuf);
+    memcpy(buf, rbuf, size);
+    return 0;
+  } while (0);
+
   with_rpath {
     res = readlink(rpath, buf, size - 1);
-    if (res != -1) buf[res] = '\0';
+    if (res != -1 && res < size) buf[res] = '\0';
   }
   return checked_zero(res);
 }
@@ -391,7 +491,7 @@ static int frefs_read(const char *path, char *buf, size_t size, off_t offset, st
   // This check is skipped for performance. `open` will do the actual check.
   // ensure_read_perm(path);
 
-  with_rpath{
+  with_rpath {
     int fd = open(rpath, O_RDONLY);
     if (fd == -1) { res = -errno; continue; }
 
