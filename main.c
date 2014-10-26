@@ -262,26 +262,44 @@ static int frefs_getattr(const char *path, struct stat *st_data) {
   return checked_zero(res);
 }
 
+static pid_t translate_proc_self_pid() {
+  static char *proc = "/proc";
+  const char *rproc = translate_path(proc);
+  pid_t rpid = 0;
+  if (rproc && rproc != proc) {
+    // translate it between pid namespaces
+    rpid = translate_pid(fuse_get_context()->pid, "/proc", rproc);
+  } else {
+    // we are in the same pid ns
+    rpid = fuse_get_context()->pid;
+  }
+  free_rpath(&rproc, proc);
+  return rpid;
+}
+
+static int should_translate_chroot(const char *path) {
+  if (!forward_cg_proc_path) return 0;
+  if (!path || path[0] == 0) return 0;
+  // /proc/1234/{exe,cwd}
+  const char *p = strchr(path + 1, '/');
+  if (!p) return 0;
+  p = strchr(p + 1, '/');
+  if (!p) return 0;
+  if (strcmp(p, "/exe") == 0) return 1;
+  if (strcmp(p, "/cwd") == 0) return 1;
+  if (strcmp(p, "/root") == 0) return 2;
+  return 0;
+}
+
 static int frefs_readlink(const char *path, char *buf, size_t size) {
   INFO("%s %s", __func__, path);
 
   ensure_read_perm(path);
+  if (size == 0) return 0;
 
   // a special case, we need to translate pid
   if (strcmp(path, "/proc/self") == 0) do {
-    static char *proc = "/proc";
-    const char *rproc = translate_path(proc);
-    pid_t rpid;
-    if (rproc && rproc != proc) {
-      // translate it between pid namespaces
-      rpid = translate_pid(fuse_get_context()->pid, "/proc", rproc);
-    } else {
-      // we are in the same pid ns
-      rpid = fuse_get_context()->pid;
-    }
-    free_rpath(&rproc, proc);
-    if (!rpid) break;
-
+    pid_t rpid = translate_proc_self_pid();
     char rbuf[sizeof(pid_t) * 3 + 1];
     snprintf(rbuf, sizeof rbuf, "%ld", (long) rpid);
     if (size > sizeof(rbuf)) size = sizeof(rbuf);
@@ -290,8 +308,56 @@ static int frefs_readlink(const char *path, char *buf, size_t size) {
   } while (0);
 
   with_rpath {
-    res = readlink(rpath, buf, size - 1);
-    if (res != -1 && res < size) buf[res] = '\0';
+    int offset = 0;
+    switch (should_translate_chroot(path)) {
+      case 2:
+        {
+          // translate "chroot", always return "/"
+          if (size > sizeof "/") size = sizeof "/";
+          memcpy(buf, "/", size);
+          { res = 0; continue /* with_rpath for loop */; }
+        }
+      case 1:
+        {
+          // readlink "root" first, then cut. assuming PATH_MAX is enough
+          int i;
+          static const int MIN_PATH_MAX = 8192;
+          char buf[PATH_MAX + 1 < MIN_PATH_MAX ? MIN_PATH_MAX : PATH_MAX + 1];
+          memset(buf, 0, sizeof(buf));
+          // we need a "chroot" rpath
+          char *chroot = malloc(strlen(rpath) + sizeof("/root"));
+          if (!chroot) break;
+
+          chroot[0] = 0;
+          // find last '/' of rpath
+          for (i = strlen(rpath) - 1; i >= 0; --i) {
+            if (rpath[i] == '/') {
+              memcpy(chroot, rpath, i);
+              memcpy(chroot + i, "/root", sizeof("/root"));
+              break;
+            }
+          }
+
+          int n = readlink(chroot, buf, sizeof(buf) - 1);
+          // set "offset" and we will cut the result from that position
+          if (n > 0) offset = n;
+          if (offset == 1) offset = 0;  // '/'
+          free(chroot);
+        }
+    }
+    if (offset > 0) {
+      char *rbuf = malloc(size + offset);
+      res = readlink(rpath, rbuf, size + offset);
+      if (res != -1) {
+        memcpy(buf, rbuf + offset, size);
+        if (res > offset) res -= offset; else res = 0;
+      }
+      free(rbuf);
+    } else {
+      res = readlink(rpath, buf, size > 0 ? size - 1 : size);
+    }
+    // FUSE uses strlen so we have to write a '\0'
+    if (res != -1 && res < size) buf[res] = 0;
   }
   return checked_zero(res);
 }
