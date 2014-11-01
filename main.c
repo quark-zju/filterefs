@@ -59,19 +59,12 @@
 #include <linux/limits.h>
 
 #include "config.h"
-#ifdef EXPERIMENT
-#include "pid_trans.h"
-#endif
 #include "utils/debug.h"
 
 
 // configuration
 static char *readable_config_path = NULL;
 static char *writable_config_path = NULL;
-#ifdef EXPERIMENT
-static char *forward_cg_proc_path = NULL;
-static int forward_cg_proc_path_len = 0;
-#endif
 static char *dest = NULL;
 
 static frefs_config_t config;
@@ -150,77 +143,11 @@ cleanup:
   if (fp) fclose(fp);
 }
 
-#ifdef EXPERIMENT
-static char *get_cgroup_name() {
-  char *result = NULL;
-
-  // lookup /proc/pid/cgroup
-  pid_t pid = fuse_get_context()->pid;
-  char path[sizeof(long) * 3 + sizeof("/proc//cgroup")];
-  snprintf(path, sizeof(path), "/proc/%ld/cgroup", (long)pid);
-  FILE *fp = fopen(path, "r");
-  if (!fp) return NULL;
-
-  char *line = NULL;
-  size_t len = 0;
-  while (getline(&line, &len, fp) != -1) {
-    // the line should look like:
-    // 4:memory:/cgname
-    char *p = strchr(line, ':');
-    if (p == NULL) continue;
-    if (strncmp(p, ":memory:/", sizeof(":memory:/") - 1) != 0) continue;
-    if (p[sizeof(":memory:/") - 1] != '\n' && p[sizeof(":memory:/") - 1] != '\0') {
-      // we got the non-empty memory cgname
-      result = strdup(p + sizeof(":memory:/") - 1);
-      // chomp
-      int len = strlen(result);
-      if (len && result[len - 1] == '\n') result[len - 1] = 0;
-    }
-    break;
-  }
-  if (line) free(line);
-  fclose(fp);
-  return result;
-}
-
-static const char *translate_path(const char *path) {
-  const char *result = path;
-  char *cgname = NULL;
-  if (!forward_cg_proc_path || strncmp(path, "/proc", 5) != 0) goto cleanup;
-
-  cgname = get_cgroup_name();
-  if (cgname == NULL) goto cleanup;
-
-  int rpath_size = strlen(cgname) + forward_cg_proc_path_len + strlen(path) + 2;
-  char *rpath = malloc(rpath_size);
-  // test it
-  snprintf(rpath, rpath_size, "%s/%s", forward_cg_proc_path, cgname);
-  if (access(rpath, F_OK) != 0) goto cleanup;
-  snprintf(rpath, rpath_size, "%s/%s%s", forward_cg_proc_path, cgname, path);
-  result = rpath;
-
-cleanup:
-  if (cgname) free(cgname);
-  return result;
-}
-
-static inline int free_rpath(const char **prpath, const char *path) {
-  if (*prpath && *prpath != path) free((char *)*prpath);
-  *prpath = NULL;
-  return 0;
-}
-
-#define with_rpath \
-  int res = 0; const char *rpath; for (rpath = translate_path(path); rpath; free_rpath(&rpath, path))
-#define with_rfrom_rto \
-  int res = 0; const char *rfrom, *rto; for (rfrom = translate_path(from), rto = translate_path(to); rfrom; free_rpath(&rfrom, from), free_rpath(&rto, to))
-#else
+// these macros make it easy to add "translate_path" logic
 #define with_rpath \
   int res = 0; const char *rpath = path; for (; rpath; rpath = NULL)
 #define with_rfrom_rto \
   int res = 0; const char *rfrom = from, *rto = to; for (; rfrom; rfrom = NULL)
-
-#endif
 
 static int frefs_getattr(const char *path, struct stat *st_data) {
   INFO("%s %s", __func__, path);
@@ -234,47 +161,8 @@ static int frefs_getattr(const char *path, struct stat *st_data) {
     res = lstat(rpath, st_data);
   }
 
-#ifdef EXPERIMENT
-  // fake file size for /proc files. this will prevent FUSE from returning empty files
-  if (strncmp(path, "/proc/", sizeof("/proc/") - 1) == 0 && S_ISREG(st_data->st_mode)) {
-    // assuming /proc files are not larger than this number
-    st_data->st_size = PROC_FILE_MAX_SIZE;
-  }
-#endif
-
   return checked_zero(res);
 }
-
-#ifdef EXPERIMENT
-static pid_t translate_proc_self_pid() {
-  static char *proc = "/proc";
-  const char *rproc = translate_path(proc);
-  pid_t rpid = 0;
-  if (rproc && rproc != proc) {
-    // translate it between pid namespaces
-    rpid = translate_pid(fuse_get_context()->pid, "/proc", rproc);
-  } else {
-    // we are in the same pid ns
-    rpid = fuse_get_context()->pid;
-  }
-  free_rpath(&rproc, proc);
-  return rpid;
-}
-
-static int should_translate_chroot(const char *path) {
-  if (!forward_cg_proc_path) return 0;
-  if (!path || path[0] == 0) return 0;
-  // /proc/1234/{exe,cwd}
-  const char *p = strchr(path + 1, '/');
-  if (!p) return 0;
-  p = strchr(p + 1, '/');
-  if (!p) return 0;
-  if (strcmp(p, "/exe") == 0) return 1;
-  if (strcmp(p, "/cwd") == 0) return 1;
-  if (strcmp(p, "/root") == 0) return 2;
-  return 0;
-}
-#endif
 
 static int frefs_readlink(const char *path, char *buf, size_t size) {
   INFO("%s %s", __func__, path);
@@ -282,75 +170,8 @@ static int frefs_readlink(const char *path, char *buf, size_t size) {
   ensure_read_perm(path);
   if (size == 0) return 0;
 
-#ifdef EXPERIMENT
-  // a special case, we need to translate pid
-  if (strcmp(path, "/proc/self") == 0) {
-    pid_t rpid = translate_proc_self_pid();
-    if (rpid > 0) {
-      char rbuf[sizeof(pid_t) * 3 + 1];
-      snprintf(rbuf, sizeof rbuf, "%ld", (long) rpid);
-      if (size > sizeof(rbuf)) size = sizeof(rbuf);
-      memcpy(buf, rbuf, size);
-      return 0;
-    } else {
-      return -ENOENT;
-    }
-  }
-#endif
-
   with_rpath {
-#ifdef EXPERIMENT
-    int offset = 0;
-    switch (should_translate_chroot(path)) {
-      case 2:
-        {
-          // translate "chroot", always return "/"
-          if (size > sizeof "/") size = sizeof "/";
-          memcpy(buf, "/", size);
-          { res = 0; continue /* with_rpath for loop */; }
-        }
-      case 1:
-        {
-          // readlink "root" first, then cut. assuming PATH_MAX is enough
-          int i;
-          static const int MIN_PATH_MAX = 8192;
-          char buf[PATH_MAX + 1 < MIN_PATH_MAX ? MIN_PATH_MAX : PATH_MAX + 1];
-          memset(buf, 0, sizeof(buf));
-          // we need a "chroot" rpath
-          char *chroot = malloc(strlen(rpath) + sizeof("/root"));
-          if (!chroot) break;
-
-          chroot[0] = 0;
-          // find last '/' of rpath
-          for (i = strlen(rpath) - 1; i >= 0; --i) {
-            if (rpath[i] == '/') {
-              memcpy(chroot, rpath, i);
-              memcpy(chroot + i, "/root", sizeof("/root"));
-              break;
-            }
-          }
-
-          int n = readlink(chroot, buf, sizeof(buf) - 1);
-          // set "offset" and we will cut the result from that position
-          if (n > 0) offset = n;
-          if (offset == 1) offset = 0;  // '/'
-          free(chroot);
-        }
-    }
-    if (offset > 0) {
-      char *rbuf = malloc(size + offset);
-      res = readlink(rpath, rbuf, size + offset);
-      if (res != -1) {
-        memcpy(buf, rbuf + offset, size);
-        if (res > offset) res -= offset; else res = 0;
-      }
-      free(rbuf);
-    } else {
-#endif
-      res = readlink(rpath, buf, size > 0 ? size - 1 : size);
-#ifdef EXPERIMENT
-    }
-#endif
+    res = readlink(rpath, buf, size > 0 ? size - 1 : size);
     // FUSE uses strlen so we have to write a '\0'
     if (res != -1 && res < size) buf[res] = 0;
   }
@@ -576,23 +397,6 @@ static int frefs_read(const char *path, char *buf, size_t size, off_t offset, st
   // ensure_read_perm(path);
 
   with_rpath {
-#ifdef EXPERIMENT
-    int skip = 0;
-
-    if (forward_cg_proc_path && strncmp(path, "/proc/", sizeof("/proc/") - 1) == 0) {
-      // forward via pid-translate service
-      static char *socket_path = "/proc/../pid-translate.sock";
-      const char *rsocket_path = translate_path(socket_path);
-      if (rsocket_path && rsocket_path != socket_path && access(rsocket_path, F_OK) == 0) {
-        res = forward_read(rpath, buf, size, offset, rsocket_path);
-        skip = 1;
-      }
-      free_rpath(&rsocket_path, socket_path);
-    }
-
-    if (skip) continue;
-#endif
-
     int fd = open(rpath, O_RDONLY);
     if (fd == -1) { res = -errno; continue; }
     res = pread(fd, buf, size, offset);
@@ -790,9 +594,6 @@ enum {
   KEY_VERSION,
   KEY_READABLE_CONFIG,
   KEY_WRITABLE_CONFIG,
-#ifdef EXPERIMENT
-  KEY_FORWARD_CG_PROC,
-#endif
 };
 
 static struct fuse_opt frefs_opts[] = {
@@ -804,9 +605,6 @@ static struct fuse_opt frefs_opts[] = {
   FUSE_OPT_KEY("--readable-config %s", KEY_READABLE_CONFIG),
   FUSE_OPT_KEY("-w %s",                KEY_WRITABLE_CONFIG),
   FUSE_OPT_KEY("--writable-config %s", KEY_WRITABLE_CONFIG),
-#ifdef EXPERIMENT
-  FUSE_OPT_KEY("--forward-cg-proc %s", KEY_FORWARD_CG_PROC),
-#endif
   FUSE_OPT_KEY("--comment %s",         KEY_COMMENT),
   FUSE_OPT_END
 };
@@ -831,16 +629,6 @@ static int frefs_parse_opt(void *data, const char *arg, int key, struct fuse_arg
       if (writable_config_path) free(writable_config_path);
       writable_config_path = strdup(arg + (arg[1] == '-' ? 17 : 2));
       return 0;
-#ifdef EXPERIMENT
-    case KEY_FORWARD_CG_PROC:
-      if (forward_cg_proc_path) free(forward_cg_proc_path);
-      forward_cg_proc_path = strdup(arg + 17);
-      forward_cg_proc_path_len = strlen(forward_cg_proc_path);
-      if (forward_cg_proc_path[forward_cg_proc_path_len - 1] == '/') {
-        forward_cg_proc_path[--forward_cg_proc_path_len] = 0;
-      }
-      return 0;
-#endif
     case KEY_COMMENT:
       return 0;
     case FUSE_OPT_KEY_NONOPT:
