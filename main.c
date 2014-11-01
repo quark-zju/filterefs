@@ -50,6 +50,7 @@
 #include <assert.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <signal.h>
 #include <sys/xattr.h>
 #include <dirent.h>
 #include <unistd.h>
@@ -58,7 +59,9 @@
 #include <linux/limits.h>
 
 #include "config.h"
+#ifdef EXPERIMENT
 #include "pid_trans.h"
+#endif
 #include "utils/debug.h"
 
 
@@ -73,6 +76,7 @@ static char *dest = NULL;
 
 static frefs_config_t config;
 
+static volatile sig_atomic_t trace_enabled = 0;
 
 #define ensure_read_perm(path) \
   if (!frefs_config_get_file_permission(&config, path, FREFS_PERM_READ)) { return -ENOENT; }
@@ -115,6 +119,35 @@ size_t dirent_buf_size(DIR * dirp) {
   if (name_max < min_name_max) name_max = min_name_max;
   size_t name_end = (size_t)offsetof(struct dirent, d_name) + name_max + 1;
   return (name_end > sizeof(struct dirent) ? name_end : sizeof(struct dirent));
+}
+
+static int is_dir(const char *path) {
+  struct stat buf;
+  if (stat(path, &buf) == -1) return 0;
+  return S_ISDIR(buf.st_mode) ? 1 : 0;
+}
+
+static void log_trace(const char *path, const char *verb) {
+  // do not log directory access
+  if (is_dir(path)) return;
+
+  char log[sizeof("/tmp/filterefs..log") + sizeof(pid_t) * 3 + 2];
+  snprintf(log, sizeof log, "/tmp/filterefs.%ld.log", (long)getpid());
+
+  FILE *fp = fopen(log, "a");
+  if (!fp) goto cleanup;
+
+  char time_str[sizeof("Wed Jun 30 21:49:08 1993\n")];
+  time_t now;
+  time(&now);
+  ctime_r(&now, time_str);
+  time_str[sizeof(time_str) - 2] = 0;
+
+  pid_t pid = fuse_get_context()->pid;
+  fprintf(fp, "%s %s %s", time_str, verb, path);
+  if (pid) fprintf(fp, " (pid %ld)\n", (long)pid); else fprintf(fp, "\n");
+cleanup:
+  if (fp) fclose(fp);
 }
 
 #ifdef EXPERIMENT
@@ -192,17 +225,22 @@ static inline int free_rpath(const char **prpath, const char *path) {
 static int frefs_getattr(const char *path, struct stat *st_data) {
   INFO("%s %s", __func__, path);
 
+  // getattr is called first (by fuse) when a process tries to access some file
+  if (__builtin_expect(trace_enabled, 0)) log_trace(path, "access");
+
   ensure_read_perm(path);
 
   with_rpath {
     res = lstat(rpath, st_data);
   }
 
+#ifdef EXPERIMENT
   // fake file size for /proc files. this will prevent FUSE from returning empty files
   if (strncmp(path, "/proc/", sizeof("/proc/") - 1) == 0 && S_ISREG(st_data->st_mode)) {
     // assuming /proc files are not larger than this number
     st_data->st_size = PROC_FILE_MAX_SIZE;
   }
+#endif
 
   return checked_zero(res);
 }
@@ -508,6 +546,8 @@ static int frefs_utimens(const char *path, const struct timespec ts[2]) {
 static int frefs_open(const char *path, struct fuse_file_info *finfo) {
   INFO("%s %s", __func__, path);
 
+  if (__builtin_expect(trace_enabled, 0)) log_trace(path, "open");
+
   if (finfo->flags & (O_WRONLY | O_RDWR | O_CREAT | O_EXCL | O_APPEND | O_TRUNC)) {
     ensure_write_perm(path);
   }
@@ -595,6 +635,8 @@ static int frefs_statfs(const char *path, struct statvfs *st_buf) {
 static int frefs_release(const char *path, struct fuse_file_info *finfo) {
   (void) path;
   (void) finfo;
+
+  if (__builtin_expect(trace_enabled, 0)) log_trace(path, "release");
 
   INFO("%s %s", __func__, path);
   return 0;
@@ -818,6 +860,22 @@ static int frefs_parse_opt(void *data, const char *arg, int key, struct fuse_arg
   return 1;
 }
 
+static void signal_handler(int signal) {
+  trace_enabled = !trace_enabled;
+}
+
+void register_signal_handler() {
+  struct sigaction sa;
+
+  memset(&sa, 0, sizeof(struct sigaction));
+  sa.sa_handler = &signal_handler;
+  sigemptyset(&sa.sa_mask);
+
+  if (sigaction(SIGUSR1, &sa, NULL) == -1) {
+    perror("cannot register SIGUSR1 handler");
+    exit(3);
+  }
+}
 
 int main(int argc, char *argv[]) {
   struct fuse_args args = FUSE_ARGS_INIT(argc, argv);
@@ -833,6 +891,8 @@ int main(int argc, char *argv[]) {
     fprintf(stderr, "can not load config files\n");
     exit(2);
   };
+
+  register_signal_handler();
 
   fuse_main(args.argc, args.argv, &frefs_oper, NULL);
 
