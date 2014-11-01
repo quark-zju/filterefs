@@ -36,7 +36,7 @@
 #ifndef FREFS_GIT_VERSION
 # define FREFS_GIT_VERSION ""
 #endif
-#define FREFS_VERSION (sizeof(FREFS_GIT_VERSION) > 1 ? FREFS_GIT_VERSION : "v0.4")
+#define FREFS_VERSION (sizeof(FREFS_GIT_VERSION) > 1 ? FREFS_GIT_VERSION : "v0.5")
 
 #include <sys/types.h>
 #include <sys/stat.h>
