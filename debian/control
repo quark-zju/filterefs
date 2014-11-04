@@ -1,0 +1,15 @@
+Source: filterefs
+Section: utils
+Priority: optional
+Maintainer: Jun Wu <quark@lihdd.net>
+Standards-Version: 3.9.3
+Build-Depends: debhelper (>= 8), libfuse-dev, git, dpkg-dev (>= 1.16.1~)
+Homepage: https://github.com/quark-zju/filterefs
+
+Package: filterefs
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}, fuse (>=2.9.0), libfuse2 (>=2.9.0)
+Description: FUSE based regular expression filter filesystem
+ filterefs is a FUSE based filesystem that mirrors / but allows the user to
+ specify which files can be read and which files can be written using POSIX
+ extended regular expressions.
