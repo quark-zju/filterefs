@@ -41,7 +41,7 @@ static int frefs_config_build_regex_from_file(const char *filepath, regex_t *pwh
   str_define(name, 1); \
   str_append(name, "^(");
 # define re_add_line(name, line) \
-  if (line != NULL && *line != 0) { \
+  if (line != NULL && *(line) != 0) { \
     int first = name ## _size <= 3; \
     str_append(name, (first ?  "(" : "|(")); \
     str_append(name, (line)); \
